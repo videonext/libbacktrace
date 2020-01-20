@@ -79,6 +79,28 @@ unwind (uintptr_t pc, void *vdata)
   return _URC_NO_REASON;
 }
 
+static DWORD64 WINAPI MyGetModuleBase64(
+        _In_  HANDLE hProcess,
+        _In_  DWORD64 dwAddr)
+{
+    (void)hProcess;
+    UNWIND_HISTORY_TABLE HistoryTable = {0};
+    DWORD64 ImageBase = 0;
+    RtlLookupFunctionEntry(dwAddr, &ImageBase, &HistoryTable);
+    return ImageBase;
+}
+
+static PVOID CALLBACK MyFunctionTableAccess64(
+        _In_  HANDLE hProcess,
+        _In_  DWORD64 AddrBase)
+{
+    (void)hProcess;
+    UNWIND_HISTORY_TABLE HistoryTable = {0};
+    DWORD64 ImageBase;
+    return RtlLookupFunctionEntry(AddrBase, &ImageBase, &HistoryTable);
+
+}
+
 static int readable_pointer(LPCVOID pointer)
 {
     // Check whether the pointer is valid and executable before dereferencing
@@ -92,33 +114,127 @@ static int readable_pointer(LPCVOID pointer)
         return 0;
     return 1;
 }
+typedef enum {
+    AddrMode1616,
+    AddrMode1632,
+    AddrModeReal,
+    AddrModeFlat
+  } ADDRESS_MODE;
 
-static UNWIND_HISTORY_TABLE HistoryTable;
-static DWORD64 WINAPI MyGetModuleBase64(
-        _In_  HANDLE hProcess,
-        _In_  DWORD64 dwAddr)
+typedef struct _tagADDRESS64 {
+    DWORD64 Offset;
+    WORD Segment;
+    ADDRESS_MODE Mode;
+  } ADDRESS64,*LPADDRESS64;
+
+typedef struct _KDHELP64 {
+    DWORD64 Thread;
+    DWORD ThCallbackStack;
+    DWORD ThCallbackBStore;
+    DWORD NextCallback;
+    DWORD FramePointer;
+    DWORD64 KiCallUserMode;
+    DWORD64 KeUserCallbackDispatcher;
+    DWORD64 SystemRangeStart;
+    DWORD64 KiUserExceptionDispatcher;
+    DWORD64 StackBase;
+    DWORD64 StackLimit;
+    DWORD64 Reserved[5];
+  } KDHELP64,*PKDHELP64;
+
+typedef struct _tagSTACKFRAME64 {
+    ADDRESS64 AddrPC;
+    ADDRESS64 AddrReturn;
+    ADDRESS64 AddrFrame;
+    ADDRESS64 AddrStack;
+    ADDRESS64 AddrBStore;
+    PVOID FuncTableEntry;
+    DWORD64 Params[4];
+    WINBOOL Far;
+    WINBOOL Virtual;
+    DWORD64 Reserved[3];
+    KDHELP64 KdHelp;
+  } STACKFRAME64,*LPSTACKFRAME64;
+
+struct stack_info
 {
-    (void)hProcess;
-    DWORD64 ImageBase = 0;
-    RtlLookupFunctionEntry(dwAddr, &ImageBase, &HistoryTable);
-    return ImageBase;
+    CONTEXT c;
+    STACKFRAME64 sf;		 /* For storing the stack information */
+};
+
+static void stack_info_init(struct stack_info *si, PUINT_PTR framep, PCONTEXT ctx)
+{
+    memset (si, 0, sizeof *si);
+
+    memcpy (&si->c, ctx, sizeof si->c);
+    
+    memset (&si->sf, 0, sizeof (si->sf));
+    
+    si->sf.AddrFrame.Offset = (UINT_PTR) framep;
+    si->sf.AddrReturn.Offset = framep[1];
+
+    si->sf.AddrPC.Mode = AddrModeFlat;
+    si->sf.AddrFrame.Mode = AddrModeFlat;
+    si->sf.AddrStack.Mode = AddrModeFlat;    
 }
 
-static PVOID CALLBACK MyFunctionTableAccess64(
-        _In_  HANDLE hProcess,
-        _In_  DWORD64 AddrBase)
+static inline void
+__unwind_single_frame (PCONTEXT ctx)
 {
-    (void)hProcess;
-    DWORD64 ImageBase;
-    return RtlLookupFunctionEntry(AddrBase, &ImageBase, &HistoryTable);
+  PRUNTIME_FUNCTION f;
+  ULONG64 imagebase;
+  UNWIND_HISTORY_TABLE hist = {0};
+  DWORD64 establisher;
+  PVOID hdl;
+
+  f = RtlLookupFunctionEntry (ctx->Rip, &imagebase, &hist);
+  if (f) {
+    RtlVirtualUnwind (0, imagebase, ctx->Rip, f, ctx, &hdl, &establisher,
+		      NULL);
+  }
+  else {
+      ctx->Rip = *(ULONG_PTR *) ctx->Rsp;
+      ctx->Rsp += 8;
+  }
 }
 
+static int stack_info_walk(struct stack_info *si)
+{
+    if (!si->c.Rip) {
+        printf("DONE: si->c.Rsp: %p, si->c.Rbp : %p\n",  (void*)si->c.Rsp,  (void*)si->c.Rbp);
+        return 0;
+    }
+
+    printf("WALK: si->c.Rip: %p, si->c.Rsp: %p, si->c.Rbp : %p, Rip readable: %d, Rsp readable: %d\n", (void*)si->c.Rip,  (void*)si->c.Rsp,  (void*)si->c.Rbp,
+           readable_pointer((LPCVOID)si->c.Rip),
+           readable_pointer((LPCVOID)si->c.Rsp)
+    );
+    if ( readable_pointer((LPCVOID)si->c.Rsp)) {
+        DWORD64 *sptr = (DWORD64*)si->c.Rsp;
+        sptr -= 4;
+        printf("sptr[0]=%p, sptr[1]=%p, sptr[2]=%p, sptr[3]=%p, sptr[4]=%p, sptr[5]=%p\n",
+                (void*)sptr[0],  (void*)sptr[1],  (void*)sptr[2],  (void*)sptr[3],  (void*)sptr[4],  (void*)sptr[5]);
+    }
+    si->sf.AddrPC.Offset    = si->c.Rip;
+    si->sf.AddrStack.Offset = si->c.Rsp;
+    si->sf.AddrFrame.Offset = si->c.Rbp;
+    
+    __unwind_single_frame (&si->c);
+  
+    return 1;
+}
+
+
+int cygwin_backtrace (void **array, int size);
+
+static void *frames[16];
 
 int __attribute__((noinline))
 backtrace_full (struct backtrace_state *state, int skip,
 		backtrace_full_callback callback,
 		backtrace_error_callback error_callback, void *data)
 {
+    int size = cygwin_backtrace(frames, 16);
     struct backtrace_data bdata;
     void *p;
 
@@ -139,24 +255,57 @@ backtrace_full (struct backtrace_state *state, int skip,
         backtrace_free (state, p, 4096, NULL, NULL);
         bdata.can_alloc = 1;
     }
+    int i;
+    char module_name_raw[MAX_PATH];
+    HANDLE process = GetCurrentProcess();
+    for (i = skip + 1; i < size; i++) {
+        DWORD64 ImageBase = MyGetModuleBase64(process, frames[i]);
+        if (ImageBase && GetModuleFileNameA((HINSTANCE)ImageBase, module_name_raw, MAX_PATH)) {
+            state->filename = module_name_raw;
+        }
+        unwind((uintptr_t)frames[i], &bdata);        
+    }
 
+// New
+#if 0    
+      CONTEXT c;
+    memset (&c, 0, sizeof c);
+    c.ContextFlags = CONTEXT_FULL;
+    RtlCaptureContext (&c);
+
+    struct stack_info si;
+    stack_info_init(&si, (PUINT_PTR) c.Rbp, &c);
+  
+    int i;
+    for (i = 0; i < 32 && stack_info_walk(&si); i++)
+    {
+        printf("%d %p %p\n", i,  (void*)si.sf.AddrFrame.Offset,  (void*)si.sf.AddrPC.Offset);
+    }
+#endif    
+
+
+#if 0
     CONTEXT context = {};
+    context.ContextFlags = CONTEXT_FULL;
+
     RtlCaptureContext(&context);
     CONTEXT cursor = context;
     int i = skip + 1;
     char module_name_raw[MAX_PATH];
-    while (1) {        
+    while (1) {
         uintptr_t *ip =  (uintptr_t*)cursor.Rip;
         uintptr_t *sp =  (uintptr_t*)cursor.Rsp;
 
-        if (*ip == 0) {
-            if (!readable_pointer((LPCVOID)*sp))
-                break;
-            cursor.Rip = *(DWORD64*)*sp;      // POP RIP (aka RET)
-            cursor.Rsp += sizeof(void*);
-            if (cursor.Rip == 0)
-                break;
-        }
+        // if (*ip == 0) {
+        //     if (!readable_pointer((LPCVOID)*sp))
+        //         break;
+        //     cursor.Rip = *(DWORD64*)*sp;      // POP RIP (aka RET)
+        //     cursor.Rsp += sizeof(void*);
+        //     if (cursor.Rip == 0) {
+                
+        //         break;
+        //     }
+        // }
         
         DWORD64 ImageBase = MyGetModuleBase64(GetCurrentProcess(), cursor.Rip);
 
@@ -178,13 +327,14 @@ backtrace_full (struct backtrace_state *state, int skip,
             unwind((uintptr_t)ip, &bdata);
         
         if (!FunctionEntry) { // assume this is a NO_FPO RBP-based function
-            cursor.Rsp = cursor.Rbp;                 // MOV RSP, RBP
-            if (!readable_pointer((LPCVOID)cursor.Rsp))
-                break;
-            cursor.Rbp = *(DWORD64*)cursor.Rsp;      // POP RBP
-            cursor.Rsp += sizeof(void*);
-            cursor.Rip = *(DWORD64*)cursor.Rsp;      // POP RIP (aka RET)
-            cursor.Rsp += sizeof(void*);
+ 
+            // cursor.Rsp = cursor.Rbp;                 // MOV RSP, RBP
+            // if (!readable_pointer((LPCVOID)cursor.Rsp))
+            //     break;
+            // cursor.Rbp = *(DWORD64*)cursor.Rsp;      // POP RBP
+            // cursor.Rsp += sizeof(void*);
+            // cursor.Rip = *(DWORD64*)cursor.Rsp;      // POP RIP (aka RET)
+            // cursor.Rsp += sizeof(void*);
         }
         else {
             PVOID HandlerData;
@@ -202,7 +352,8 @@ backtrace_full (struct backtrace_state *state, int skip,
         if (cursor.Rip == 0)
             break;        
     }
-  
+#endif
+    
     return bdata.ret;
 }
 #else
